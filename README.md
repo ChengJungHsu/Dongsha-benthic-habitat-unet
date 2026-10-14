@@ -88,6 +88,12 @@
 * `habitat_map_superdove8_bh_unet_pred.tif`：具備投影坐標之高解析度底棲棲地分類圖（LZW 壓縮 GeoTIFF）。
 * `habitat_map_superdove8_bh_unet_evaluation_report.log`：獨立驗證區與全圖之混淆矩陣、OA、Kappa、PA、UA、IoU 及 F1-Score 評估報表。
 
+![benthic_habitat_comparison_gt_vs_pred](https://github.com/user-attachments/assets/41ebf45f-05f0-465a-ba3a-f4c488ff8710)
+*▲ 圖 2：模型預測棲地分布*
+
+![benthic_habitat_comparison_gt_vs_pred](https://github.com/user-attachments/assets/2b7c8b73-041e-44d4-9312-67a01a795e19))
+*▲ 圖 2：6 類別混淆矩陣評估結果*
+
 ---
 
 ## 專案結構與腳本說明
