@@ -1,0 +1,30 @@
+# Python 快取與虛擬環境
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+env/
+venv/
+
+# 空間光柵與向量原始圖資 (體積龐大)
+data/*.tif
+data/*.tiff
+data/*.geojson
+data/*.shp
+data/*.shx
+data/*.dbf
+data/*.prj
+data/*.cpg
+
+# 前處理快取張量與訓練產物
+*.npz
+*.h5
+*.hdf5
+output/
+*.pth
+*.pt
+*.log
+
+# 系統暫存檔案
+.DS_Store
+Thumbs.db
