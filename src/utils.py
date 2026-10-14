@@ -10,7 +10,7 @@ from shapely.ops import polygonize
 from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
 import torch
 import torch.nn.functional as F
-from torch.amp import autocast
+from torch.amp import autocast, DataLoader
 from torch.utils.data import Dataset
 
 # ==============================================================================
