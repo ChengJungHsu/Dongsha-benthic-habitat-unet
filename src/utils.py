@@ -12,6 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from src.model import BHUNet
+from src.loss import CombinedLoss, compute_elastic_regularization
+
 
 # ==============================================================================
 # Domain Constants
@@ -68,7 +72,7 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"訓練裝置: {device} | 批次大小: {batch_size}")
 
-    data = np.load(data_path, , mmap_mode='r')
+    data = np.load(data_path, mmap_mode='r')
     train_x = data['train_x']
     train_y = data['train_y']
     val_x = data['val_x']
