@@ -120,3 +120,102 @@ class BHUNet(nn.Module):
         d1 = self.dec1(d2, e1)
 
         return self.final_conv(d1)
+
+class DepthFeatureExtractor(nn.Module):
+    """
+    水深獨立降採樣特徵分支：
+    將 (B, 1, 256, 256) 的水深平滑圖降採樣 4 次 (共 1/16 尺度，對應 16x16 網格)
+    提取出高層語意地形特徵，不干擾淺層光譜。
+    """
+    def __init__(self, out_channels=32):
+        super(DepthFeatureExtractor, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, stride=2, padding=1),   # 128x128
+            nn.GroupNorm(1, 8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),  # 64x64
+            nn.GroupNorm(2, 16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 24, kernel_size=3, stride=2, padding=1), # 32x32
+            nn.GroupNorm(4, 24),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(24, out_channels, kernel_size=3, stride=2, padding=1), # 16x16
+            nn.GroupNorm(4, out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, depth):
+        return self.net(depth)
+
+
+class BHUNet_LateFusion(nn.Module):
+    """
+    延後特徵融合 (Late Fusion) BH-UNet：
+    輸入格式保持不變：(B, 9, H, W)，其中 [:, 0:8] 為光譜，[:, 8:9] 為水深。
+    無需修改任何資料加載器 (DataLoader) 或前處理產生的 .npz！
+    """
+    def __init__(self, num_classes=6, base_channels=16, depth_channels=32):
+        super(BHUNet_LateFusion, self).__init__()
+        c = base_channels # 16
+
+        # 1. 光譜主幹編碼器 (專心處理 8 個光譜通道)
+        self.enc1 = ConvBlock(8, c)
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.enc2 = ConvBlock(c, c * 2) # 32
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.enc3 = ConvBlock(c * 2, c * 4) # 64
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.enc4 = ConvBlock(c * 4, c * 8) # 128
+        self.pool4 = nn.MaxPool2d(2)
+
+        # 2. 光譜 Bottleneck
+        self.bottleneck = ConvBlock(c * 8, c * 16) # 256
+
+        # 3. 水深獨立分支 (輸出 depth_channels=32)
+        self.depth_branch = DepthFeatureExtractor(out_channels=depth_channels)
+
+        # 4. 融合降維卷積：將 (256 + 32 = 288) 降維回到 256
+        self.fuse_conv = nn.Sequential(
+            nn.Conv2d((c * 16) + depth_channels, c * 16, kernel_size=1, bias=False),
+            nn.GroupNorm(8, c * 16),
+            nn.ReLU(inplace=True)
+        )
+
+        # 5. 解碼器 (結構與通道數完全保持原樣，與跳躍連接無縫相容)
+        self.dec4 = DecoderBlock(c * 16, c * 8, c * 8)
+        self.dec3 = DecoderBlock(c * 8, c * 4, c * 4)
+        self.dec2 = DecoderBlock(c * 4, c * 2, c * 2)
+        self.dec1 = DecoderBlock(c * 2, c, c)
+
+        self.final_conv = nn.Conv2d(c, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # 於網路輸入端解耦：切分光譜與水深
+        spec_x = x[:, :8, :, :]   # (B, 8, H, W)
+        depth_x = x[:, 8:, :, :]  # (B, 1, H, W)
+
+        # 步驟一：光譜特徵提取 (不受水深數值干擾)
+        e1 = self.enc1(spec_x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
+        b = self.bottleneck(self.pool4(e4)) # (B, 256, H/16, W/16)
+
+        # 步驟二：提取水深高階地形特徵
+        d_feat = self.depth_branch(depth_x) # (B, 32, H/16, W/16)
+
+        # 步驟三：在 Bottleneck 進行延後拼接融合
+        fused_b = torch.cat([b, d_feat], dim=1) # (B, 288, H/16, W/16)
+        fused_b = self.fuse_conv(fused_b)       # (B, 256, H/16, W/16)
+
+        # 步驟四：正常解碼出圖
+        d4 = self.dec4(fused_b, e4)
+        d3 = self.dec3(d4, e3)
+        d2 = self.dec2(d3, e2)
+        d1 = self.dec1(d2, e1)
+
+        logits = self.final_conv(d1)
+        return logits

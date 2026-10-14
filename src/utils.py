@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
-from src.model import BHUNet
+#from src.model import BHUNet
+from src.model import BHUNet_LateFusion
 from src.loss import CombinedLoss, compute_elastic_regularization
 
 
@@ -71,6 +72,7 @@ def run_training(
 ):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"延後特徵融合UNet模型:多光譜+水深")
     print(f"訓練裝置: {device} | 批次大小: {batch_size}")
 
     data = np.load(data_path, mmap_mode='r')
@@ -89,9 +91,10 @@ def run_training(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    print(f"輸入通道數: {in_channels} | 訓練切塊: {len(train_ds)} | 獨立驗證切塊: {len(val_ds)}")
+    print(f"輸入通道數(光譜+水深): {in_channels} | 訓練切塊: {len(train_ds)} | 獨立驗證切塊: {len(val_ds)}")
 
-    model = BHUNet(in_channels=in_channels, num_classes=num_classes, base_channels=16).to(device)
+    #model = BHUNet(in_channels=in_channels, num_classes=num_classes, base_channels=16).to(device)
+    model = BHUNet_LateFusion(num_classes=num_classes, base_channels=16).to(device)
     criterion = CombinedLoss(weight=loss_weights, num_classes=num_classes, ignore_index=255)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
