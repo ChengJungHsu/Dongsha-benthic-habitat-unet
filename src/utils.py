@@ -11,7 +11,7 @@ from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast, DataLoader
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 
 # ==============================================================================
 # Domain Constants
@@ -68,7 +68,7 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"訓練裝置: {device} | 批次大小: {batch_size}")
 
-    data = np.load(data_path)
+    data = np.load(data_path, , mmap_mode='r')
     train_x = data['train_x']
     train_y = data['train_y']
     val_x = data['val_x']
