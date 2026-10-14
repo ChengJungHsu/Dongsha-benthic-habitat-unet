@@ -8,7 +8,7 @@ import geopandas as gpd
 import torch
 
 # 引用 src 模組
-from src.model import BHUNet
+from src.model import BHUNet_LateFusion
 from src.utils import (
     align_and_resample_raster,
     convert_linestrings_to_polygons,
@@ -44,8 +44,8 @@ def run_standalone_evaluation_pipeline(
     inv_class_to_idx = {idx: cls for idx, cls in enumerate(valid_class_codes)}
 
     # 1. 載入模型與權重
-    logger.info(">>> 階段 1: 載入 BHUNet (in_channels=9)...")
-    model = BHUNet(in_channels=9, num_classes=len(valid_class_codes), base_channels=16).to(device)
+    logger.info(">>> 階段 1: 載入 BHUNet_LateFusion (in_channels=9)...")
+    model = BHUNet_LateFusion(num_classes=len(valid_class_codes), base_channels=16, depth_channels=32).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt)
     model.eval()
@@ -139,22 +139,19 @@ def run_standalone_evaluation_pipeline(
         logger.info(f">>> 成功產製底棲分類圖: {output_tif}")
 
     # 6. 精度評估 (獨立空間測試區 vs. 全圖)
-    logger.info("
->>> 階段 5: 執行嚴格交叉精度評估...")
+    logger.info(">>> 階段 5: 執行嚴格交叉精度評估...")
     trainable_pixels = valid_water_pixels & np.isin(labels, valid_class_codes)
 
     if os.path.exists(preprocess_npz_path):
         prep = np.load(preprocess_npz_path)
         if 'val_blocks_mask' in prep:
             test_pixels = trainable_pixels & prep['val_blocks_mask']
-            logger.info("
-" + "=" * 60)
+            logger.info("" + "=" * 60)
             logger.info(">>> 【1. 嚴格空間獨立測試區 (Unseen Spatial Blocks)】精度評估：")
             logger.info("=" * 60)
             log_structured_evaluation(logger, labels[test_pixels], final_classified_map[test_pixels], ACA_BENTHIC_CLASSES, "[空間獨立測試區] ")
 
-    logger.info("
-" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info(">>> 【2. 全場景參考標籤 (Full Scene Reference)】精度評估：")
     logger.info("=" * 60)
     log_structured_evaluation(logger, labels[trainable_pixels], final_classified_map[trainable_pixels], ACA_BENTHIC_CLASSES, "[全場景參考] ")

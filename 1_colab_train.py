@@ -1,5 +1,5 @@
 # %%
-# !git clone https://ChengJungHsu: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@github.com/ChengJungHsu/Dongsha-benthic-habitat-unet.git
+# !git clone -b feature/late-fusion https://ChengJungHsu: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@github.com/ChengJungHsu/Dongsha-benthic-habitat-unet.git
 # %cd Dongsha-benthic-habitat-unet
 
 # %%

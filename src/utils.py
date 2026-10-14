@@ -94,7 +94,7 @@ def run_training(
     print(f"輸入通道數(光譜+水深): {in_channels} | 訓練切塊: {len(train_ds)} | 獨立驗證切塊: {len(val_ds)}")
 
     #model = BHUNet(in_channels=in_channels, num_classes=num_classes, base_channels=16).to(device)
-    model = BHUNet_LateFusion(num_classes=num_classes, base_channels=16).to(device)
+    model = BHUNet_LateFusion(num_classes=num_classes, base_channels=16, depth_channels=32).to(device)
     criterion = CombinedLoss(weight=loss_weights, num_classes=num_classes, ignore_index=255)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
