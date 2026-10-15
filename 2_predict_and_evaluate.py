@@ -158,7 +158,7 @@ def run_standalone_evaluation_pipeline(
 
 if __name__ == "__main__":
     run_standalone_evaluation_pipeline(
-        checkpoint_path=r"./output/best_bh_unet_model_9CH.pth",
+        checkpoint_path=r"./output/best_bh_unet_model_9CH_latefusion_epoch76.pth",
         image_path=r"./data/PlanetScope_20200518_composite.tif",
         depth_path=r"./data/fine_grid_5m_waterdepth.tif",
         ground_truth_path=r"./data/mask_aligned.tif",
