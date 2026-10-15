@@ -22,9 +22,10 @@ from src.loss import CombinedLoss, compute_elastic_regularization
 # ==============================================================================
 # Domain Constants
 # ==============================================================================
+# Correct ACA_BENTHIC_CLASSES which has ID=1 for Seagrass 
 ACA_BENTHIC_CLASSES = {
-    1: "Coral/Algae",
-    2: "Seagrass",
+    1: "Seagrass",
+    2: "Coral/Algae",
     3: "Sand",
     4: "Microalgal Mats",
     5: "Rock",
