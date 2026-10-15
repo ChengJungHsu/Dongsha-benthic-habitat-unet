@@ -64,11 +64,11 @@ class BenthicSegmentationDataset(Dataset):
 
 def run_training(
     data_path,
-    output_dir,
+    output_path,
     epochs: int = 60,
     batch_size: int = 32,
-    lr: float = 0.0015,
-    early_stopping_patience: int = 8
+    lr: float = 0.0010,
+    early_stopping_patience: int = 15
 ):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,7 +99,7 @@ def run_training(
     scaler = GradScaler('cuda')
 
     best_val_loss = float('inf')
-    best_weights_path = os.path.join(output_dir, "best_bh_unet_model_9CH.pth")
+    best_weights_path = output_path
     patience_cnt = 0
 
     t_start = datetime.datetime.now()
