@@ -208,7 +208,8 @@ def run_training(
     epochs: int = 60,
     batch_size: int = 32,
     lr: float = 0.0010,
-    flag_use_late_fusion:bool = True,
+    early_stopping_patience: int = 15,
+    flag_use_late_fusion: bool = True,
     depth_in_channels: int = 1,
     depth_channels: int = 32
 ):
