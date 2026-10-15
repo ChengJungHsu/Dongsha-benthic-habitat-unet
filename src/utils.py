@@ -5,6 +5,7 @@ import numpy as np
 import rasterio
 import datetime
 from rasterio.warp import reproject, Resampling
+from rasterio.features import rasterize
 import geopandas as gpd
 from shapely.geometry import Polygon
 from shapely.ops import polygonize
@@ -14,8 +15,8 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
-from src.model import BHUNet
-from src.loss import CombinedLoss, compute_elastic_regularization
+from .model import BHUNet_LateFusion
+from .loss import CombinedLoss, compute_elastic_regularization
 
 
 # ==============================================================================
@@ -62,13 +63,154 @@ class BenthicSegmentationDataset(Dataset):
             return torch.from_numpy(img).float(), torch.from_numpy(mask).long()
         return torch.from_numpy(img).float()
 
+# 新增至 src/utils.py
+def run_local_preprocessing(
+    sat_file: str,
+    bathy_file: str,
+    groundtruth_file: str,
+    roi_file: str,
+    output_npz: str,
+    target_res: float = 3.0,
+    z_max: float = 10.0,
+    patch_size: int = 256,
+    stride: int = 128,
+    include_depth: bool = True,
+    target_band_indices: list = None
+):
+    target_dir = os.path.dirname(output_npz)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    print(">>> 階段 1: 讀取向量與定義網格幾何...")
+    roi_gdf = gpd.read_file(roi_file)
+    with rasterio.open(sat_file) as src_sat:
+        base_crs = src_sat.crs
+        total_bands = src_sat.count
+
+    if roi_gdf.crs != base_crs:
+        roi_gdf = roi_gdf.to_crs(base_crs)
+    roi_gdf = convert_linestrings_to_polygons(roi_gdf)
+
+    minx, miny, maxx, maxy = roi_gdf.total_bounds
+    target_width = int(np.ceil((maxx - minx) / target_res))
+    target_height = int(np.ceil((maxy - miny) / target_res))
+    target_transform = rasterio.transform.from_bounds(minx, miny, maxx, maxy, target_width, target_height)
+    target_shape = (target_height, target_width)
+
+    roi_geoms = [(geom, 1) for geom in roi_gdf.geometry if geom.is_valid and not geom.is_empty]
+    rasterized_roi = rasterize(roi_geoms, out_shape=target_shape, transform=target_transform, fill=0, dtype=np.uint8)
+    inside_roi_mask = (rasterized_roi == 1)
+
+    print(">>> 階段 2: 空間重採樣光譜波段與地形圖層...")
+    if target_band_indices is None:
+        target_band_indices = list(range(1, total_bands + 1))
+
+    bands_data = []
+    for b_idx in target_band_indices:
+        b_arr, _ = align_and_resample_raster(sat_file, base_crs, target_transform, target_shape, band_idx=b_idx)
+        bands_data.append(np.nan_to_num(b_arr, nan=0.0).astype(np.float32))
+
+    feature_stack = np.stack(bands_data, axis=0)
+    op_channels = feature_stack.shape[0]
+
+    depth, depth_nodata = align_and_resample_raster(bathy_file, base_crs, target_transform, target_shape, band_idx=1, resampling=Resampling.cubic)
+    labels, _ = align_and_resample_raster(groundtruth_file, base_crs, target_transform, target_shape, band_idx=1, resampling=Resampling.nearest)
+    labels = np.nan_to_num(labels, nan=0).astype(np.int32)
+
+    is_depth_invalid = np.isnan(depth) | np.isinf(depth) | (depth <= 0.0)
+    if depth_nodata is not None:
+        is_depth_invalid |= np.isclose(depth, depth_nodata)
+    valid_water_pixels = inside_roi_mask & (~is_depth_invalid) & (depth <= z_max)
+
+    print(f">>> 階段 3: 執行空間平衡正規化 ({op_channels} 個光譜波段)...")
+    for c in range(op_channels):
+        valid_vals = feature_stack[c][valid_water_pixels]
+        min_v = np.percentile(valid_vals, 0.5) if len(valid_vals) > 0 else 0.0
+        max_v = np.percentile(valid_vals, 99.5) if len(valid_vals) > 0 else 1.0
+        if max_v > min_v:
+            clipped = np.clip(feature_stack[c], min_v, max_v)
+            feature_stack[c] = (clipped - min_v) / (max_v - min_v)
+        else:
+            feature_stack[c] = np.zeros_like(feature_stack[c])
+        feature_stack[c] = np.nan_to_num(feature_stack[c], nan=0.0)
+
+    if include_depth:
+        norm_depth = np.clip(depth / z_max, 0.0, 1.0).astype(np.float32)
+        norm_depth = np.nan_to_num(norm_depth, nan=0.0)
+        norm_depth[~valid_water_pixels] = 0.0
+        norm_depth = np.expand_dims(norm_depth, axis=0)
+        final_feature_stack = np.concatenate([feature_stack, norm_depth], axis=0)
+        depth_in_channels = 1
+    else:
+        final_feature_stack = feature_stack
+        depth_in_channels = 0
+
+    total_channels = final_feature_stack.shape[0]
+
+    print(">>> 階段 4: 構建標籤遮罩並執行切塊與空間獨立切分...")
+    valid_class_codes = sorted(list(ACA_BENTHIC_CLASSES.keys()))
+    class_to_idx = {cls: idx for idx, cls in enumerate(valid_class_codes)}
+    ignore_index = 255
+    dense_mask = np.full(target_shape, ignore_index, dtype=np.uint8)
+
+    trainable_pixels = valid_water_pixels & (np.isin(labels, valid_class_codes))
+    class_counts = []
+    for cls_code, cls_idx in class_to_idx.items():
+        c_mask = trainable_pixels & (labels == cls_code)
+        dense_mask[c_mask] = cls_idx
+        class_counts.append(np.sum(c_mask))
+
+    class_counts = np.array(class_counts, dtype=np.float32)
+    smoothed_weights = np.sqrt(np.sum(class_counts) / (class_counts + 1e-4))
+    smoothed_weights = np.clip(smoothed_weights / np.mean(smoothed_weights), 0.6, 3.5).astype(np.float32)
+
+    patches_x, patches_y, coords = extract_overlapping_patches_fast(
+        final_feature_stack, dense_mask, patch_size=patch_size, stride=stride, min_valid_ratio=0.05, ignore_index=ignore_index
+    )
+
+    block_size = patch_size * 4
+    block_ids = (coords[:, 0] // block_size) * 100 + (coords[:, 1] // block_size)
+    unique_blocks = np.unique(block_ids)
+
+    np.random.seed(42)
+    np.random.shuffle(unique_blocks)
+    val_block_count = max(1, int(len(unique_blocks) * 0.15))
+    val_blocks = unique_blocks[:val_block_count]
+
+    val_mask = np.isin(block_ids, val_blocks)
+    train_mask = ~val_mask
+
+    val_spatial_mask = np.zeros(target_shape, dtype=bool)
+    for r, c_idx in coords[val_mask]:
+        val_spatial_mask[r:r+patch_size, c_idx:c_idx+patch_size] = True
+
+    np.savez_compressed(
+        output_npz,
+        train_x=patches_x[train_mask],
+        train_y=patches_y[train_mask],
+        val_x=patches_x[val_mask],
+        val_y=patches_y[val_mask],
+        loss_weights=smoothed_weights,
+        class_codes=np.array(valid_class_codes),
+        val_blocks_mask=val_spatial_mask,
+        op_channels=np.array(op_channels),
+        depth_in_channels=np.array(depth_in_channels),
+        total_channels=np.array(total_channels)
+    )
+
+    print(f"特徵輸出統計: 總通道數={total_channels} (光譜={op_channels}, 水深={depth_in_channels})")
+    print(f">>> 前處理完成，壓縮包已儲存至: {output_npz}")
+    return depth_in_channels, op_channels, total_channels
+
 def run_training(
     data_path,
     output_path,
     epochs: int = 60,
     batch_size: int = 32,
     lr: float = 0.0010,
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 15,
+    depth_in_channels: int = 1,
+    depth_channels: int = 32
 ):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,6 +224,8 @@ def run_training(
     loss_weights = torch.tensor(data['loss_weights'], dtype=torch.float32).to(device)
     num_classes = len(data['class_codes'])
     in_channels = train_x.shape[1]
+    op_channels = in_channels - depth_in_channels
+    print(f"輸入通道數: {in_channels} | 光譜通道數: {op_channels} | 地形通道數: {depth_in_channels}")
 
     train_ds = BenthicSegmentationDataset(train_x, train_y, is_train=True)
     val_ds   = BenthicSegmentationDataset(val_x, val_y, is_train=False)
@@ -89,10 +233,17 @@ def run_training(
     num_workers = 2 if torch.cuda.is_available() else 0
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-
-    print(f"輸入通道數: {in_channels} | 訓練切塊: {len(train_ds)} | 獨立驗證切塊: {len(val_ds)}")
-
-    model = BHUNet(in_channels=in_channels, num_classes=num_classes, base_channels=16).to(device)
+    
+    print(f"訓練切塊: {len(train_ds)} | 獨立驗證切塊: {len(val_ds)}")
+    
+    model = BHUNet_LateFusion(
+        op_channels=op_channels,
+        depth_in_channels=depth_in_channels,
+        use_late_fusion=flag_use_late_fusion,
+        num_classes=num_classes, 
+        base_channels=16, 
+        depth_channels=depth_channels).to(device)
+    
     criterion = CombinedLoss(weight=loss_weights, num_classes=num_classes, ignore_index=255)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
@@ -350,7 +501,6 @@ def predict_full_scene_bh_unet(
 
     weight_accum = np.maximum(weight_accum, 1e-6)
     return prob_accum / weight_accum
-
 
 def log_structured_evaluation(
     logger: logging.Logger,

@@ -67,56 +67,145 @@ class DecoderBlock(nn.Module):
         x = torch.cat([x, skip], dim=1)
         return self.conv_block(x)
 
-
-class BHUNet(nn.Module):
+class DepthFeatureExtractor(nn.Module):
     """
-    Benthic Habitat UNet (BH-UNet) with Squeeze-and-Excitation Attention.
+    水深獨立降採樣特徵分支：
+    將 (B, depth_in_channels, 256, 256) 的水深圖經過 4 次步長為 2 的卷積
+    降採樣至 1/16 尺度 (16x16)，提煉出高階地形特徵。
+    """
+    def __init__(self, in_channels=1, out_channels=32):
+        super(DepthFeatureExtractor, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 8, kernel_size=3, stride=2, padding=1),   # 128x128
+            nn.GroupNorm(1, 8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),  # 64x64
+            nn.GroupNorm(2, 16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 24, kernel_size=3, stride=2, padding=1), # 32x32
+            nn.GroupNorm(4, 24),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(24, out_channels, kernel_size=3, stride=2, padding=1), # 16x16
+            nn.GroupNorm(4, out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, depth):
+        return self.net(depth)
+
+
+class BHUNet_LateFusion(nn.Module):
+    """
+    通用型 BH-UNet 模型：支援純光譜、Early Fusion（全部一起算）與 Late Fusion（解耦融合）。
     
-    Args:
-        in_channels (int): Input feature channels (e.g., 9 for 8-band + bathymetry).
-        num_classes (int): Number of semantic habitat classes (e.g., 6 for ACA classes).
-        base_channels (int): Base feature multiplier (default: 16).
+    參數說明：
+    - op_channels: 光譜波段數 (例如 8 或 4)
+    - depth_in_channels: 水深/地形通道數 (例如 1 或 0)
+    - use_late_fusion: 
+        * True : 啟用 Late Fusion（光譜走主幹，水深走獨立分支並於 Bottleneck 融合）
+        * False: 啟用 Early Fusion（將光譜與水深共 9 通道直接作為 enc1 輸入，全部一起算）
     """
-    def __init__(self, in_channels: int = 9, num_classes: int = 6, base_channels: int = 16):
-        super(BHUNet, self).__init__()
-        c = base_channels
+    def __init__(
+        self,
+        op_channels: int = 8,
+        depth_in_channels: int = 1,
+        use_late_fusion: bool = True,
+        num_classes: int = 6,
+        base_channels: int = 16,
+        depth_channels: int = 32
+    ):
+        super(BHUNet_LateFusion, self).__init__()
+        self.op_channels = op_channels
+        self.depth_in_channels = depth_in_channels
+        self.use_late_fusion = use_late_fusion
+        c = base_channels # 16
 
-        # Encoder
-        self.enc1 = ConvBlock(in_channels, c)
+        # -------------------------------------------------------------
+        # 1. 判斷第一層編碼器 (enc1) 的輸入通道數
+        # -------------------------------------------------------------
+        if self.depth_in_channels > 0 and not self.use_late_fusion:
+            # 【全部一起算 (Early Fusion)】：輸入為 8 + 1 = 9 通道
+            first_in_channels = self.op_channels + self.depth_in_channels
+        else:
+            # 【Late Fusion】或【純光譜】：enc1 專注處理光譜通道 (8 通道)
+            first_in_channels = self.op_channels
+
+        self.enc1 = ConvBlock(first_in_channels, c)
         self.pool1 = nn.MaxPool2d(2)
 
-        self.enc2 = ConvBlock(c, c * 2)
+        self.enc2 = ConvBlock(c, c * 2) # 32
         self.pool2 = nn.MaxPool2d(2)
 
-        self.enc3 = ConvBlock(c * 2, c * 4)
+        self.enc3 = ConvBlock(c * 2, c * 4) # 64
         self.pool3 = nn.MaxPool2d(2)
 
-        self.enc4 = ConvBlock(c * 4, c * 8)
+        self.enc4 = ConvBlock(c * 4, c * 8) # 128
         self.pool4 = nn.MaxPool2d(2)
 
-        # Bottleneck
-        self.bottleneck = ConvBlock(c * 8, c * 16)
+        # -------------------------------------------------------------
+        # 2. 光譜 Bottleneck
+        # -------------------------------------------------------------
+        self.bottleneck = ConvBlock(c * 8, c * 16) # 256
 
-        # Decoder with Skip Connections
+        # -------------------------------------------------------------
+        # 3. 條件式建立水深分支 (僅在開啟 Late Fusion 且有水深時建立)
+        # -------------------------------------------------------------
+        if self.depth_in_channels > 0 and self.use_late_fusion:
+            self.depth_branch = DepthFeatureExtractor(
+                in_channels=depth_in_channels,
+                out_channels=depth_channels
+            )
+            # Bottleneck 融合降維層 (256 + 32 -> 256)
+            self.fuse_conv = nn.Sequential(
+                nn.Conv2d((c * 16) + depth_channels, c * 16, kernel_size=1, bias=False),
+                nn.GroupNorm(8, c * 16),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.depth_branch = None
+            self.fuse_conv = None
+
+        # -------------------------------------------------------------
+        # 4. 解碼器與跳躍連接 (所有模式共用相同維度)
+        # -------------------------------------------------------------
         self.dec4 = DecoderBlock(c * 16, c * 8, c * 8)
         self.dec3 = DecoderBlock(c * 8, c * 4, c * 4)
         self.dec2 = DecoderBlock(c * 4, c * 2, c * 2)
         self.dec1 = DecoderBlock(c * 2, c, c)
 
-        # Output projection
         self.final_conv = nn.Conv2d(c, num_classes, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
-        e4 = self.enc4(self.pool3(e3))
+    def forward(self, x):
+        # 模式 A：【全部一起算 (Early Fusion)】
+        # x 為完整的 9 通道，直接整包送入編碼器
+        if self.depth_in_channels > 0 and not self.use_late_fusion:
+            e1 = self.enc1(x)
+            e2 = self.enc2(self.pool1(e1))
+            e3 = self.enc3(self.pool2(e2))
+            e4 = self.enc4(self.pool3(e3))
+            b = self.bottleneck(self.pool4(e4))
 
-        b = self.bottleneck(self.pool4(e4))
+        # 模式 B：【Late Fusion】或【純光譜】
+        else:
+            spec_x = x[:, :self.op_channels, :, :]  # 前 8 通道為光譜
+            e1 = self.enc1(spec_x)
+            e2 = self.enc2(self.pool1(e1))
+            e3 = self.enc3(self.pool2(e2))
+            e4 = self.enc4(self.pool3(e3))
+            b = self.bottleneck(self.pool4(e4))     # (B, 256, H/16, W/16)
 
+            # 若開啟 Late Fusion，在 Bottleneck 提取並融合水深特徵
+            if self.depth_in_channels > 0 and self.use_late_fusion:
+                depth_x = x[:, self.op_channels:, :, :]  # 第 9 通道為水深
+                d_feat = self.depth_branch(depth_x)       # (B, depth_channels, H/16, W/16)
+                fused_b = torch.cat([b, d_feat], dim=1)   # Concat
+                b = self.fuse_conv(fused_b)               # 降為 256
+
+        # 解碼器還原空間解析度出圖
         d4 = self.dec4(b, e4)
         d3 = self.dec3(d4, e3)
         d2 = self.dec2(d3, e2)
         d1 = self.dec1(d2, e1)
 
         return self.final_conv(d1)
+

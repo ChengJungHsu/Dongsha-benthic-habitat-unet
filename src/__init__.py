@@ -4,31 +4,35 @@ Benthic Habitat Mapping using BH-UNet
 Modular codebase for remote sensing multi-spectral & bathymetric semantic segmentation.
 """
 
-from .model import BHUNet, ChannelwiseAttention, ConvBlock, DecoderBlock
-from .loss import SoftDiceLoss, CombinedLoss, compute_elastic_regularization
+from .model import BHUNet_LateFusion
+from .loss import SoftDiceLoss, CombinedLoss
 from .utils import (
-    align_and_resample_raster,
+    BenthicSegmentationDataset,
+    run_local_preprocessing,
+    run_training,
+    setup_logger,
     convert_linestrings_to_polygons,
+    align_and_resample_raster,
     extract_overlapping_patches_fast,
     predict_full_scene_bh_unet,
     log_structured_evaluation,
     ACA_BENTHIC_CLASSES,
-    SUPERDOVE_8BANDS
+    SUPERDOVE_8BANDS    
 )
 
 __all__ = [
-    "BHUNet",
-    "ChannelwiseAttention",
-    "ConvBlock",
-    "DecoderBlock",
+    "BHUNet_LateFusion",
     "SoftDiceLoss",
     "CombinedLoss",
-    "compute_elastic_regularization",
-    "align_and_resample_raster",
+    "BenthicSegmentationDataset",
+    "run_local_preprocessing",
+    "run_training",
+    "setup_logger",
     "convert_linestrings_to_polygons",
+    "align_and_resample_raster",
     "extract_overlapping_patches_fast",
     "predict_full_scene_bh_unet",
     "log_structured_evaluation",
     "ACA_BENTHIC_CLASSES",
-    "SUPERDOVE_8BANDS"
+    "SUPERDOVE_8BANDS" 
 ]
