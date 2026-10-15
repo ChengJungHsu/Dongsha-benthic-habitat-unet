@@ -32,7 +32,7 @@ ACA_BENTHIC_CLASSES = {
 }
 
 SUPERDOVE_8BANDS = [
-    'coastal_blue', 'blue', 'green_ii', 'green', 
+    'coastal_blue', 'blue', 'green-I', 'green', 
     'yellow', 'red', 'red_edge', 'nir'
 ]
 
@@ -63,8 +63,8 @@ class BenthicSegmentationDataset(Dataset):
         return torch.from_numpy(img).float()
 
 def run_training(
-    data_path: str = "/content/drive/MyDrive/benthic_unet/preprocessed_benthic_data_9CH.npz",
-    output_dir: str = "/content/drive/MyDrive/benthic_unet/output",
+    data_path,
+    output_dir,
     epochs: int = 60,
     batch_size: int = 32,
     lr: float = 0.0015,

@@ -79,11 +79,11 @@ def run_local_preprocessing(
         feature_stack[c] = np.nan_to_num(feature_stack[c], nan=0.0)
 
     # 深度正規化 (0 ~ z_max -> 0 ~ 1) 作為第 9 通道
-    norm_depth = np.clip(depth / z_max, 0.0, 1.0).astype(np.float32)
-    norm_depth = np.nan_to_num(norm_depth, nan=0.0)
-    norm_depth[~valid_water_pixels] = 0.0
-    norm_depth = np.expand_dims(norm_depth, axis=0)
-    feature_stack_9b = np.concatenate([feature_stack, norm_depth], axis=0) # (9, H, W)
+    # norm_depth = np.clip(depth / z_max, 0.0, 1.0).astype(np.float32)
+    # norm_depth = np.nan_to_num(norm_depth, nan=0.0)
+    # norm_depth[~valid_water_pixels] = 0.0
+    # norm_depth = np.expand_dims(norm_depth, axis=0)
+    # feature_stack_9b = np.concatenate([feature_stack, norm_depth], axis=0) # (9, H, W)
 
     print(">>> 階段 4: 構建標籤遮罩並執行切塊與空間獨立切分...")
     valid_class_codes = sorted(list(ACA_BENTHIC_CLASSES.keys()))
@@ -102,8 +102,11 @@ def run_local_preprocessing(
     smoothed_weights = np.sqrt(np.sum(class_counts) / (class_counts + 1e-4))
     smoothed_weights = np.clip(smoothed_weights / np.mean(smoothed_weights), 0.6, 3.5).astype(np.float32)
 
+    # patches_x, patches_y, coords = extract_overlapping_patches_fast(
+        # feature_stack_9b, dense_mask, patch_size=patch_size, stride=stride, min_valid_ratio=0.05, ignore_index=ignore_index
+    # )
     patches_x, patches_y, coords = extract_overlapping_patches_fast(
-        feature_stack_9b, dense_mask, patch_size=patch_size, stride=stride, min_valid_ratio=0.05, ignore_index=ignore_index
+        feature_stack, dense_mask, patch_size=patch_size, stride=stride, min_valid_ratio=0.05, ignore_index=ignore_index
     )
 
     # 空間棋盤區塊劃分 (Spatial Block Split: 1024 像素大單元)
@@ -143,7 +146,7 @@ if __name__ == "__main__":
         bathy_file=r"./data/fine_grid_5m_waterdepth.tif",
         groundtruth_file=r"./data/mask_aligned.tif",
         roi_file=r"./data/roi_10m.geojson",
-        output_npz=r"./output/preprocessed_benthic_data_9CH.npz",
+        output_npz=r"./output/preprocessed_benthic_data_8CH.npz",
         target_res=3.0,
         z_max=10.0,
         patch_size=256,
