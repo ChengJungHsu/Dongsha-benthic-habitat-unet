@@ -203,12 +203,12 @@ def run_local_preprocessing(
     return depth_in_channels, op_channels, total_channels
 
 def run_training(
-    data_path,
-    output_path,
+    data_path: str,
+    output_path: str = "./output",
     epochs: int = 60,
     batch_size: int = 32,
     lr: float = 0.0010,
-    early_stopping_patience: int = 15,
+    flag_use_late_fusion:bool = True,
     depth_in_channels: int = 1,
     depth_channels: int = 32
 ):

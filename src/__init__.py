@@ -5,7 +5,7 @@ Modular codebase for remote sensing multi-spectral & bathymetric semantic segmen
 """
 
 from .model import BHUNet_LateFusion
-from .loss import SoftDiceLoss, CombinedLoss
+from .loss import SoftDiceLoss, CombinedLoss, compute_elastic_regularization
 from .utils import (
     BenthicSegmentationDataset,
     run_local_preprocessing,
@@ -24,6 +24,7 @@ __all__ = [
     "BHUNet_LateFusion",
     "SoftDiceLoss",
     "CombinedLoss",
+    "compute_elastic_regularization",
     "BenthicSegmentationDataset",
     "run_local_preprocessing",
     "run_training",
