@@ -23,7 +23,7 @@ run_training(
     early_stopping_patience = 15,
     flag_use_late_fusion = True,
     depth_in_channels = 1,
-    depth_channels: int = 32
+    depth_channels = 32
 )
 
 # no LateFusion
@@ -36,5 +36,5 @@ run_training(
     early_stopping_patience = 15,
     flag_use_late_fusion = False,
     depth_in_channels = 1,
-    depth_channels: int = 32
+    depth_channels = 32
 )
