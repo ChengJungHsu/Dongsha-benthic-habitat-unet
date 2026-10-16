@@ -130,8 +130,9 @@
 *圖 3：空間獨立驗證評估統計盒狀圖*
 
 #### 4. Training Dataset Distribution
-![npz_spatial_and_class_distribution_geo](https://github.com/user-attachments/assets/f9202556-ab79-47ad-bf97-d61f3e36030b)
+![npz_spatial_and_class_distribution_geo](https://github.com/user-attachments/assets/13aff47b-ec54-463b-b70c-17a87bd9be1e)
 *圖 4：訓練資料集空間與類別地理分佈*
+
 
 ---
 
