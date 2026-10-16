@@ -115,6 +115,25 @@
 * `habitat_map_pred.tif`：具備 EPSG:32650 投影坐標之底棲棲地分類圖（LZW 壓縮 GeoTIFF）[cite: 59]。
 * `evaluation_report.log`：包含空間獨立測試區與全場景之混淆矩陣、OA、Kappa、PA、UA、IoU 及 F1-Score 評估報表[cite: 59]。
 
+### 成果視覺化與評估圖表
+
+#### 1. Predicted Benthic Map
+![benthic_habitat_comparison_gt_vs_pred](https://github.com/user-attachments/assets/29fdafa4-95f4-4dff-9a21-a983284923d2)
+*圖 1：底棲棲地預測圖與 Ground Truth 對比*
+
+#### 2. Confusion Matrix
+![confusion_matrix_strict_spatial_mean_20runs](https://github.com/user-attachments/assets/ab9bcdc0-1988-44df-ac0e-a51df1e7b36a)
+*圖 2：嚴格空間劃分 20 次實驗平均混淆矩陣*
+
+#### 3. Evaluation Statistics
+![evaluation_strict_spatial_boxplots](https://github.com/user-attachments/assets/15bacdd3-e1d7-4402-a64d-fea115a072e6)
+*圖 3：空間獨立驗證評估統計盒狀圖*
+
+#### 4. Training Dataset Distribution
+![npz_spatial_and_class_distribution_geo](https://github.com/user-attachments/assets/f9202556-ab79-47ad-bf97-d61f3e36030b)
+*圖 4：訓練資料集空間與類別地理分佈*
+
+
 ---
 
 ## 專案結構與模組說明
