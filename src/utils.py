@@ -32,6 +32,16 @@ ACA_BENTHIC_CLASSES = {
     6: "Rubble"
 }
 
+# ACA 官方標準視覺化配色
+ACA_HEX_COLORS = {
+    1: "#66C2A5",  # Seagrass (翠綠)
+    2: "#E78AC3",  # Coral/Algae (粉紅/洋紅)
+    3: "#FFD92F",  # Sand (明黃)
+    4: "#A6D854",  # Microalgal Mats (黃綠)
+    5: "#8DA0CB",  # Rock (藍灰)
+    6: "#FC8D62"   # Rubble (橘紅)
+}    
+
 SUPERDOVE_8BANDS = [
     'coastal_blue', 'blue', 'green-I', 'green', 
     'yellow', 'red', 'red_edge', 'nir'

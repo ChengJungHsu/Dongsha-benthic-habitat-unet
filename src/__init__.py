@@ -31,6 +31,7 @@ from .utils import (
     # 輔助與常數
     setup_logger,
     ACA_BENTHIC_CLASSES,
+    ACA_HEX_COLORS,
     SUPERDOVE_8BANDS    
 )
 
@@ -62,5 +63,6 @@ __all__ = [
     # 輔助與常數
     "setup_logger",
     "ACA_BENTHIC_CLASSES",
+    "ACA_HEX_COLORS",
     "SUPERDOVE_8BANDS"
 ]
