@@ -1,177 +1,220 @@
-# PlanetScope SuperDove 8-Band + Bathymetry BH-UNet 底棲棲地分類專案
+# PlanetScope SuperDove 多光譜 + 數值水深 (Bathymetry) BH-UNet 底棲棲地分類專案
 
-本專案實作結合高解析度 PlanetScope SuperDove 8 波段光學多光譜遙測衛星影像與數值水深模型（Bathymetry），透過引入通道注意力機制（Channelwise Attention）的 **BH-UNet** 深度學習模型，針對 Allen Coral Atlas (ACA) 標準 6 大底棲棲地分類體系進行語意分割（Semantic Segmentation）與全場景製圖。
+本專案實作結合高解析度 PlanetScope SuperDove 多光譜衛星遙測影像與數值水深模型（Bathymetry），透過引入通道注意力機制（Channelwise Attention）與延後特徵融合（Late Fusion）的 **BH-UNet** 深度學習架構，針對 Allen Coral Atlas (ACA) 標準 6 大底棲棲地分類體系進行高解析度語意分割（Semantic Segmentation）與全場景空間製圖。
 
-本專案採用 **「本地端前處理 $\to$ 雲端 GPU 高速訓練 $\to$ 本地端平滑融合推論與精度評估」** 的混合協同工作流程，兼顧大尺度遙測空間資料處理效率與深度學習運算效能。
+本版本為 **`dev2` 重構更新版**，全面實現「**地理特徵處理數值同構**」、「**4CH / 5CH / 8CH / 9CH 多通道彈性切換**」、「**Late Fusion 與 Early Fusion 自由配置**」以及「**推論端自動架構檢驗**」，大幅強化模型泛化能力與工程架構之模組化程度。
 
 ---
 
 ## 目錄
-- [系統架構與工作流程](#系統架構與工作流程)
-- [核心模型特性 (BH-UNet)](#核心模型特性-bh-unet)
-- [輸入資訊與成果輸出](#輸入資訊與成果輸出)
-- [專案結構與腳本說明](#專案結構與腳本說明)
-- [可調控關鍵參數](#可調控關鍵參數)
-- [本地端與 GitHub 開發指引](#本地端與-github-開發指引)
+- [系統核心特點 (dev2 更新要點)](#系統核心特點-dev2-更新要點)
+- [系統架構與協同工作流程](#系統架構與協同工作流程)
+- [模型架構：BHUNet_LateFusion](#模型架構bhunet_latefusion)
+- [輸入資訊、波段配置與成果輸出](#輸入資訊波段配置與成果輸出)
+- [專案結構與模組說明](#專案結構與模組說明)
+- [可調控關鍵參數清單](#可調控關鍵參數清單)
+- [執行步驟指引 (本地與雲端)](#執行步驟指引-本地與雲端)
+- [實驗指標對比與性能分析](#實驗指標對比與性能分析)
 
 ---
 
-## 系統架構與工作流程
+## 系統核心特點 (dev2 更新要點)
+
+1. **地理特徵處理數值同構 (Processing Isomorphism)**：
+   * 抽取共用核心函數 `build_spatial_grid_from_roi` 與 `prepare_feature_stack` 於 `src/utils.py`[cite: 59]。
+   * 前處理（切塊訓練）與推論出圖（全圖預測）**100% 呼叫完全相同的特徵提取與 0.5%~99.5% 空間平衡分位數正規化邏輯**，消除過去因兩端代碼分立造成的尺度漂移與邊界偏差[cite: 59]。
+2. **多通道動態相容 (4CH / 5CH / 8CH / 9CH)**：
+   * **4CH**：PlanetScope 擷取純光譜 RGB & NIR（Blue: 2, Green: 4, Red: 6, NIR: 8）[cite: 59]。
+   * **5CH**：4 波段光譜 + 1 通道數值水深[cite: 59]。
+   * **8CH**：PlanetScope SuperDove 全 8 波段純光譜[cite: 59]。
+   * **9CH**：8 波段光譜 + 1 通道數值水深[cite: 59]。
+3. **特徵融合策略彈性解耦 (Late Fusion vs. Early Fusion)**：
+   * 內建 `BHUNet_LateFusion`，透過 `DepthFeatureExtractor` 將平滑水深獨立降採樣 16 倍，於 Bottleneck 進行語意特徵拼接[cite: 60]。
+   * 支援 `use_late_fusion` 參數：設為 `True` 啟用解耦融合（大幅消除水深均值對淺層光譜注意力的干擾）；設為 `False` 則為早期融合（全部通道直接於第 1 層卷積混合）[cite: 60]。
+4. **推論端自動架構檢驗 (Automatic Checkpoint Inspection)**：
+   * `run_standalone_evaluation_pipeline` 具備 `inspect_checkpoint_architecture` 演算法，直接分析權重檔第一層卷積形狀與模組鍵值，**自動推導出模型所需通道數與融合模式**，無需手動改寫推論代碼[cite: 59]。
+5. **空間獨立棋盤切分 (Spatial Block Split)**：
+   * 以 $1024 \times 1024$ 像素的大空間網格抽樣劃分獨立驗證區（15%）與訓練區（85%），徹底阻斷 50% 滑窗重疊造成的空間自相關與數據外洩（Data Leakage）[cite: 59]。
+
+---
+
+## 系統架構與協同工作流程
 
 ```
 [本地端 (Local Workstation)]
-  0_local_preprocess.py
-    ├── 1. 空間幾何網格對齊 (重構多邊形 ROI，定義基準坐標系 EPSG:32650 與 3.0 m 解析度)
-    ├── 2. PlanetScope 8 光譜波段與數值水深 (Bathymetry) 空間重採樣
-    ├── 3. 有效水體遮罩篩選 (0 < depth <= 10.0 m，排除陸地與深水無效像元)
-    ├── 4. 空間平衡分位數正規化 (8 Bands: 0.5%~99.5%, Depth: 0~10m 縮放) -> 堆疊為 9 通道張量
-    ├── 5. 50% 重疊滑窗切塊 (256x256, stride=128)
-    └── 6. 空間棋盤塊切分 (Spatial Block Split: 1024x1024 空間塊，85% Train / 15% Val，阻斷鄰近外洩)
-         └── 產出: preprocessed_benthic_data_9CH.npz (上傳至雲端儲存)
+  0_local_preprocess.py (簡潔入口腳本)
+    ├── 呼叫 src.utils.build_spatial_grid_from_roi (定義 EPSG:32650 與 3.0m 仿射矩陣)
+    ├── 呼叫 src.utils.prepare_feature_stack (動態擷取 4CH/8CH，可選串接水深)
+    ├── 有效水體遮罩篩選 (0 < depth <= 10.0m)
+    ├── 滑窗切塊提取 (256x256, stride=128, 50% 重疊)
+    └── 空間棋盤獨立切分 (1024m 區塊) 
+         └── 產出: preprocessed_benthic_data_XCH.npz (包含通道中繼資料)
                      │
-                     ▼
-[雲端平台 (Google Colab / Cloud GPU)]
+                     ▼ 上傳至 Google Drive
+[雲端平台 (Google Colab - GPU)]
   1_colab_train.py
-    ├── 1. 載入 preprocessed_benthic_data_9CH.npz
-    ├── 2. 構建 9 通道 BH-UNet 模型 (in_channels=9, num_classes=6)
-    ├── 3. 複合損失函數 (CombinedLoss: 0.6 * Weighted-CE + 0.4 * Soft-Dice)
-    ├── 4. 自動混合精度 (AMP FP16) + CosineAnnealing 學習率退火 + 彈性網路正則化 (Elastic Net)
-    ├── 5. 空間獨立驗證集監控 (Early Stopping Patience=8)
-    └── 6. 回寫最佳權重檔: best_bh_unet_model_9CH.pth (下載回本地端)
+    ├── 載入 .npz 快取資料
+    ├── 構建 BHUNet_LateFusion (自動設定 op_channels, depth_in_channels)
+    ├── 複合損失函數 (CombinedLoss: 0.6 * Weighted-CE + 0.4 * Soft-Dice)
+    ├── AMP FP16 自動混合精度加速 + CosineAnnealingLR 學習率排程
+    └── 儲存最佳權重檔: best_bh_unet_model_XCH.pth (含架構元數據)
                      │
-                     ▼
-[本地端 (Local Workstation / Dedicated GPU)]
-  2_predict_and_evaluate.py
-    ├── 1. 載入 best_bh_unet_model_9CH.pth (配置 in_channels=9)
-    ├── 2. 讀取原始圖資，以相同標準正規化構建全場景 9 通道空間陣列
-    ├── 3. Hanning 窗平滑加權重疊推論 (消除 Patch 拼接邊界效應)
-    ├── 4. 輸出標準 GeoTIFF (帶有 EPSG:32650 投影資訊與仿射變換矩陣)
-    └── 5. 嚴格精度交叉評估: 分別統計「空間獨立測試區 (Unseen Blocks)」與「全場景參考」混淆矩陣
+                     ▼ 下載回本地端
+[本地端 (Local Workstation)]
+  2_predict_and_evaluate.py (通用推論腳本)
+    ├── 自動分析 .pth 權重結構 (判定 4/5/8/9 通道與 Late Fusion 開關)
+    ├── 呼叫共用特徵準備模組 (保證與前處理數值 100% 同構)
+    ├── 全圖 2D Hanning 窗平滑重疊推論 (無縫消除 Patch 邊界拼接痕跡)
+    ├── 產出高解析度地理坐標 GeoTIFF (帶有 EPSG:32650 投影)
+    └── 嚴格精度交叉報告: 分別輸出「空間獨立測試區」與「全場景參考」混淆矩陣與指標
 ```
 
 ---
 
-## 核心模型特性 (BH-UNet)
+## 模型架構：BHUNet_LateFusion
 
-1. **通道注意力機制 (Channelwise Attention)**：
-   * 在每個編碼器與解碼器特徵提取模組整合 Squeeze-and-Excitation 機制，透過全局平均池化（GAP）與全連接層學習 9 個通道（8 個光譜波段 + 1 個地形水深）的自適應權重，動態增強水下有效穿透波段與地形邊界特徵，抑制水體雜訊。
-2. **群組正規化 (GroupNorm)**：
-   * 全網路以 `GroupNorm(num_groups=8)` 取代傳統 `BatchNorm`。正規化統計量在通道群組內計算，不依賴批次大小（Batch Size），即使在本地小顯存或大批次環境下均能維持梯度高度穩定。
-3. **複合損失函數抗不平衡 (Combined Loss: Weighted CE + Soft Dice)**：
-   * 結合以樣本頻率逆平方根計算的 `Class-Weighted CrossEntropy` 與 `SoftDiceLoss`，既保留 Cross-Entropy 的平滑收斂特性，又利用 Dice 損失強化對微藻席（Microalgal Mats）、珊瑚礁碎屑（Rubble）等稀少類別的邊界約束。
-4. **Hanning 窗空間平滑融合 (Hanning Window Tiling Fusion)**：
-   * 推論階段採用 50% 重疊滑窗推論，並於重疊像元乘載 2D Hanning 窗權重進行平滑累加平均，徹底解決遙測大圖拼貼常見的格網方塊接縫（Seamline Artifacts）。
-5. **空間獨立區塊驗證 (Spatial Block Cross-Validation)**：
-   * 前處理切塊時以 $1024 \times 1024$ 像素之大空間網格進行訓練集與驗證集劃分，避免相鄰 Patch 因 50% 重疊產生空間自相關（Spatial Autocorrelation）與資料外洩（Data Leakage）。
+模型核心定義於 `src/model.py`，支援純光譜、Early Fusion 與 Late Fusion 模式[cite: 60]：
+
+```
+[光譜輸入 (4CH 或 8CH)] ──► Enc1 (16) ──► Enc2 (32) ──► Enc3 (64) ──► Enc4 (128) ──► Bottleneck (256)
+                                                                                          │
+[水深輸入 (1CH)]       ──► DepthFeatureExtractor (4次 Stride=2 卷積, 輸出 32ch) ──────────┘
+                                                                                          │ Concat
+                                                                                 [融合層: 288 -> 256]
+                                                                                          │
+[輸出 (6 類底棲棲地)]  ◄── FinalConv ◄── Dec1 (16) ◄── Dec2 (32) ◄── Dec3 (64) ◄── Dec4 (128)
+```
+[cite: 60]
+
+* **Channelwise Attention (通道注意力)**：在編碼器與解碼器模組中自適應調整通道權重，增強水下透水關鍵光譜特徵[cite: 60]。
+* **Group Normalization (群組正規化)**：全面取代傳統 BatchNorm，即便在本地端小批次（Batch Size = 4~8）下依然保持梯度穩定[cite: 60]。
+* **DepthFeatureExtractor**：獨立將平滑水深降採樣至 1/16 尺寸，提煉宏觀水深邊界特徵，避免干擾淺層光譜紋理[cite: 60]。
 
 ---
 
-## 輸入資訊與成果輸出
+## 輸入資訊、波段配置與成果輸出
 
-### 1. ACA 底棲棲地 6 大分類體系
-* **[1] Coral/Algae**：活珊瑚與大型藻類複合基質
-* **[2] Seagrass**：海草床
+### 1. Allen Coral Atlas (ACA) 底棲 6 大標準分類體系
+* **[1] Seagrass**：海草床
+* **[2] Coral/Algae**：活珊瑚與大型藻類複合底質
 * **[3] Sand**：沙質沉積物
 * **[4] Microalgal Mats**：微藻席 / 底棲微藻
-* **[5] Rock**：堅硬岩石基盤 / 礁岩
-* **[6] Rubble**：破碎珊瑚石 / 礫石
+* **[5] Rock**：裸岩基盤 / 礁岩
+* **[6] Rubble**：珊瑚碎石 / 礫石
 
-### 2. 輸入圖資規範
-* **多光譜衛星影像**：PlanetScope SuperDove 8-Band 反射率光柵（Coastal Blue, Blue, Green II, Green, Yellow, Red, Red Edge, NIR）。
-* **數值水深光柵 (Bathymetry)**：高解析度淺海測深模型（單位：公尺），作為第 9 特徵通道。
-* **真實標籤圖層 (Ground Truth)**：對齊 ACA 6 大類別代碼之真實標記光柵。
-* **分析範圍向量 (ROI)**：研究區 GeoJSON / Shapefile，支援線段或多邊形幾何。
+### 2. 衛星影像與地形圖層
+* **PlanetScope SuperDove 衛星影像**（8 波段）：
+  * `Coastal Blue (1)`、`Blue (2)`、`Green-I (3)`、`Green (4)`、`Yellow (5)`、`Red (6)`、`Red Edge (7)`、`NIR (8)`[cite: 59]。
+  * 當配置為 4CH 模式時，系統自動擷取 **`[2, 4, 6, 8]`**（Blue, Green, Red, NIR）[cite: 59]。
+* **數值水深模型 (Bathymetry)**：
+  * 高解析度淺海水深光柵，水深範圍 $0 \sim 10.0\,	ext{m}$，經由三次方內插重採樣至 3m 解析度[cite: 59]。
 
-### 3. 產出成果
-* `preprocessed_benthic_data_9CH.npz`：空間切分完成之 9 通道訓練與驗證切塊張量快取包。
-* `best_bh_unet_model_9CH.pth`：經空間驗證集篩選之最佳 PyTorch 模型權重檔。
-* `habitat_map_superdove8_bh_unet_pred.tif`：具備投影坐標之高解析度底棲棲地分類圖（LZW 壓縮 GeoTIFF）。
-* `habitat_map_superdove8_bh_unet_evaluation_report.log`：獨立驗證區與全圖之混淆矩陣、OA、Kappa、PA、UA、IoU 及 F1-Score 評估報表。
-
-![benthic_habitat_comparison_gt_vs_pred](https://github.com/user-attachments/assets/41ebf45f-05f0-465a-ba3a-f4c488ff8710)
-*▲ 圖 2：模型預測棲地分布*
-
-![benthic_habitat_comparison_gt_vs_pred](https://github.com/user-attachments/assets/2b7c8b73-041e-44d4-9312-67a01a795e19))
-*▲ 圖 2：6 類別混淆矩陣評估結果*
+### 3. 輸出成果
+* `preprocessed_benthic_data_XCH.npz`：空間棋盤劃分之訓練/驗證切塊張量包（內含通道元數據與驗證遮罩）[cite: 59]。
+* `best_bh_unet_model_XCH_*.pth`：最佳模型權重檔[cite: 59]。
+* `habitat_map_pred.tif`：具備 EPSG:32650 投影坐標之底棲棲地分類圖（LZW 壓縮 GeoTIFF）[cite: 59]。
+* `evaluation_report.log`：包含空間獨立測試區與全場景之混淆矩陣、OA、Kappa、PA、UA、IoU 及 F1-Score 評估報表[cite: 59]。
 
 ---
 
-## 專案結構與腳本說明
+## 專案結構與模組說明
 
 ```
-benthic-habitat-unet/
-├── data/                                 # 原始圖資 (被 .gitignore 排除)
+Dongsha_benthic_habitat_unet/
+├── data/                                 # 原始地理圖資 (被 .gitignore 排除)
 │   ├── PlanetScope_20200518_composite.tif
 │   ├── fine_grid_5m_waterdepth.tif
 │   ├── mask_aligned.tif
 │   └── roi_10m.geojson
 ├── output/                               # 產出成果目錄
 │   ├── preprocessed_benthic_data_9CH.npz
-│   ├── best_bh_unet_model_9CH.pth
-│   ├── habitat_map_superdove8_bh_unet_pred.tif
-│   └── habitat_map_superdove8_bh_unet_evaluation_report.log
+│   ├── best_bh_unet_model_9CH_LF.pth
+│   ├── habitat_map_pred.tif
+│   └── evaluation_report.log
 ├── notebooks/
-│   └── 1_colab_train.ipynb               # Google Colab 訓練用 Jupyter 筆記本
-├── src/
-│   ├── __init__.py
-│   ├── model.py                          # BHUNet 與 ChannelwiseAttention 架構定義
-│   ├── loss.py                           # SoftDiceLoss 與 CombinedLoss 實作
-│   └── utils.py                          # 空間幾何對齊、Hanning窗融合與精度評估工具
-├── 0_local_preprocess.py                 # 本地端光柵對齊、水深正規化與空間切塊腳本
-├── 1_colab_train.py                      # 雲端 GPU 混合精度訓練腳本
-├── 2_predict_and_evaluate.py             # 本地端 9 通道全圖平滑推論與精度評估腳本
-├── environment.yml                       # Conda 環境配置檔
+│   └── 1_colab_train.ipynb               # Google Colab 雲端訓練筆記本
+├── src/                                  # 核心演算法與資料處理模組庫
+│   ├── __init__.py                       # 統一導出公開 API 介面
+│   ├── model.py                          # BHUNet_LateFusion, DepthFeatureExtractor, ConvBlock
+│   ├── loss.py                           # CombinedLoss (Weighted CE + Soft Dice)
+│   └── utils.py                          # 數值同構特徵準備、空間對齊、滑窗推論與精度評估
+├── 0_local_preprocess.py                 # 本地端前處理進入點腳本
+├── 1_colab_train.py                      # 雲端 GPU 訓練執行腳本
+├── 2_predict_and_evaluate.py             # 通用全自動推論出圖與評估腳本
+├── environment.yml                       # Conda 環境檔
 ├── requirements.txt                      # pip 套件清單
-├── .gitignore                            # Git 忽略設定
+├── .gitignore                            # Git 排除設定
 └── README.md                             # 專案說明文件
 ```
 
 ---
 
-## 可調控關鍵參數
+## 可調控關鍵參數清單
 
-| 腳本名稱 | 參數名稱 | 預設值 | 說明與調優指引 |
-| :--- | :--- | :--- | :--- |
-| `0_local_preprocess.py` | `target_res` | `3.0` | 空間重採樣網格解析度（公尺），建議維持衛星原生解析度。 |
-| | `z_max` | `10.0` | 水深截斷上限（公尺），超過此深度之水體視為深海無效像元。 |
-| | `patch_size` / `stride` | `256` / `128` | 切塊大小與移動步長。`stride=128` 即 50% 重疊；欲擴大訓練量可縮小至 `64`。 |
-| | `block_size` | `1024` | 空間棋盤劃分塊大小，確保訓練與驗證 Patch 間存在物理隔離。 |
-| | `min_valid_ratio` | `0.05` | 單張 Patch 中有效標籤像素比例門檻，低於此值則剔除。 |
-| `1_colab_train.py` | `in_channels` | `9` | 模型輸入維度（8 個光譜波段 + 1 個數值水深通道）。 |
-| | `batch_size` | `32` | 訓練批次大小。Colab T4 (16GB) 建議設 `32`，A100 可設 `64`。 |
-| | `lr` | `0.0015` | AdamW 初始學習率，搭配 CosineAnnealing 進行動態退火。 |
-| | `epochs` / `early_stopping_patience`| `60` / `8` | 最大訓練輪數與早停耐心值，以驗證集 Loss 為基準。 |
-| | `CombinedLoss 權重` | `0.6*CE + 0.4*Dice` | CE 維持宏觀梯度穩定，Dice 提升少數類別分割效果。 |
-| `2_predict_and_evaluate.py`| `batch_size` | `8` | 本地推論批次。Quadro P1000 (4GB) 建議設 `8`（推論耗時約 60~80s）。 |
-| | `stride` | `128` | 推論移動步長。配合 50% 重疊之 Hanning 窗消除接縫。 |
+| 腳本 / 模組 | 參數名稱 | 預設值 | 說明與調優指引 |
+| :--- | :--- | :---: | :--- |
+| `0_local_preprocess.py` | `include_depth` | `True` | 是否將水深堆疊為額外特徵通道（`False` 則為純光譜）[cite: 58]。 |
+| | `target_band_indices` | `None` | 指定光譜波段索引。`None` 為讀取全波段；設 `[2, 4, 6, 8]` 擷取 RGB+NIR[cite: 58]。 |
+| | `target_res` | `3.0` | 空間重採樣網格解析度（公尺）[cite: 58]。 |
+| | `z_max` | `10.0` | 有效透水水深上限（公尺）[cite: 58]。 |
+| | `patch_size` / `stride` | `256` / `128` | 切塊大小與移動步長（`stride=128` 即 50% 重疊）[cite: 58]。 |
+| `1_colab_train.py` | `flag_use_late_fusion`| `True` | 是否啟用 Late Fusion 解耦融合分支[cite: 43]。 |
+| | `batch_size` | `32` | 訓練批次大小（Colab T4 建議設 32）[cite: 43]。 |
+| | `lr` | `0.001` | AdamW 初始學習率，隨 Cosine 退火[cite: 43]。 |
+| | `epochs` / `early_stopping_patience` | `80` / `15` | 最大訓練輪數與早停容忍度（建議設 15 避免過早中斷）[cite: 43]。 |
+| `2_predict_and_evaluate.py` | `batch_size` | `8` | 本地推論批次（Quadro P1000 4GB 顯存建議設 8）[cite: 57]。 |
+| | `stride` | `128` | 推論滑窗步長（配合 2D Hanning 窗消除接縫痕跡）[cite: 57]。 |
 
 ---
 
-## 本地端與 GitHub 開發指引
+## 執行步驟指引 (本地與雲端)
 
-### 1. 本地環境建置 (Conda)
-建議於本地端工作站建立專屬 Python 虛擬環境：
+### 1. 本地端產製前處理資料 (`0_local_preprocess.py`)
+打開 `0_local_preprocess.py` 配置需求模式後執行：
 ```bash
-conda create -n benthic_ml python=3.10 -y
-conda activate benthic_ml
-
-# 安裝 PyTorch (CUDA 11.8 / 12.1 依本地顯卡驅動選擇)
-conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
-
-# 安裝空間光柵與地理資訊套件
-conda install -c conda-forge rasterio geopandas shapely scikit-learn pandas
+# 產製 9CH 或 4CH 前處理資料
+python 0_local_preprocess.py
 ```
+產出的 `.npz` 壓縮檔上傳至 Google Drive 的指定路徑[cite: 58]。
 
-### 2. 執行流程
-1. **執行本地端前處理**：
-   ```bash
-   python 0_local_preprocess.py
-   ```
-   產出 `preprocessed_benthic_data_9CH.npz`。
-2. **上傳並於雲端訓練**：
-   將 `.npz` 上傳至 Google Drive 指定路徑，開啟 `1_colab_train.py`（或 Notebook）完成訓練，並下載 `best_bh_unet_model_9CH.pth` 回本地 `output/` 目錄。
-3. **執行本地端推論與精度評估**：
-   ```bash
-   python 2_predict_and_evaluate.py
-   ```
-   檢視終端機精度報表，並可將產出之 `habitat_map_superdove8_bh_unet_pred.tif` 拖曳至 QGIS / ArcGIS 中疊加檢驗。
+### 2. 雲端訓練模型 (`1_colab_train.py` 或 Notebook)
+在 Colab 上掛載 Google Drive 並執行訓練：
+```python
+from src.utils import run_training
+
+# 範例：啟動 9CH Late Fusion 訓練
+run_training(
+    data_path="/content/drive/MyDrive/machine_learning/benthic_unet/preprocessed_benthic_data_9CH.npz",
+    output_path="/content/drive/MyDrive/machine_learning/benthic_unet/output/best_bh_unet_model_9CH_LF.pth",
+    epochs=80,
+    batch_size=32,
+    lr=0.001,
+    early_stopping_patience=15,
+    flag_use_late_fusion=True,
+    depth_in_channels=1,
+    depth_channels=32
+)
+```
+訓練完成後，將最佳權重 `.pth` 下載至本機 `output/` 目錄[cite: 43]。
+
+### 3. 本地端推論出圖與精度交叉評估 (`2_predict_and_evaluate.py`)
+程式具備自動辨識機制，直接執行即可：
+```bash
+python 2_predict_and_evaluate.py
+```
+程式將自動輸出分類 GeoTIFF 並在終端機與 Log 檔案中打印混淆矩陣報表[cite: 57]。
+
+---
+
+## 實驗指標對比與性能分析
+
+本專案在相同地理試驗區（東沙環礁淺海）之各模型版本實測成果對比如下[cite: 62, 63, 64]：
+
+| 模型架構版本 | 輸入特徵配置 | 融合策略 | 全場景 Overall Accuracy (OA) | 全場景 Kappa 係數 | 空間獨立測試區 OA | 核心表現判讀 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **4CH 純光譜** | RGB + NIR (4) | 無 | 67.59% | 0.5644 | 64.76% | 基準純光譜模型，運算最快[cite: 64]。 |
+| **5CH Early Fusion** | RGB + NIR + Depth (5) | 早期卷積 | *(特徵通道對應修正後)* ~66.5% | ~0.5500 | ~66.0% | 水深平滑數值對可見光波段產生微幅干擾[cite: 62]。 |
+| **5CH Late Fusion** | RGB + NIR + Depth (5) | 延後融合 | **66.98%** | **0.5623** | **67.28%** | 解耦架構有效保護光譜特徵，海草 PA 達 79.2%[cite: 63]。 |
+| **8CH 純光譜** | SuperDove 全波段 (8) | 無 | 69.57% | 0.5927 | 68.44% | 光譜解析度提升，大幅改善各類別可分度[cite: 25]。 |
+| **9CH Early Fusion** | 8 Bands + Depth (9) | 早期卷積 | 67.12% | 0.5556 | 66.85% | 早期融合易因水深均值主導注意力而過早早停[cite: 23]。 |
+| **9CH Late Fusion** | 8 Bands + Depth (9) | 延後融合 | **72.02%** | **0.6261** | **68.44%** | **全專案最佳精度**，海草與微藻席 PA 大幅拉升[cite: 32]。 |
