@@ -133,7 +133,6 @@
 ![npz_spatial_and_class_distribution_geo](https://github.com/user-attachments/assets/f9202556-ab79-47ad-bf97-d61f3e36030b)
 *圖 4：訓練資料集空間與類別地理分佈*
 
-
 ---
 
 ## 專案結構與模組說明
