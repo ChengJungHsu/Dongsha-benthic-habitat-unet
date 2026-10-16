@@ -824,8 +824,7 @@ def run_standalone_evaluation_pipeline(
         logger.info(f">>> 成功產製底棲分類圖: {output_tif}")
 
     # 7. 精度驗證評估 (空間獨立測試區 vs. 全場景)
-    logger.info("
->>> 階段 5: 執行嚴格交叉精度評估...")
+    logger.info(">>> 階段 5: 執行嚴格交叉精度評估...")
     labels, _ = align_and_resample_raster(ground_truth_path, base_crs, target_transform, target_shape, band_idx=1, resampling=Resampling.nearest)
     labels = np.nan_to_num(labels, nan=0).astype(np.int32)
     trainable_pixels = valid_water_pixels & np.isin(labels, valid_class_codes)
@@ -834,14 +833,12 @@ def run_standalone_evaluation_pipeline(
         prep = np.load(preprocess_npz_path)
         if 'val_blocks_mask' in prep:
             test_pixels = trainable_pixels & prep['val_blocks_mask']
-            logger.info("
-" + "=" * 60)
+            logger.info("" + "=" * 60)
             logger.info(">>> 【1. 嚴格空間獨立測試區 (Unseen Spatial Blocks)】精度評估：")
             logger.info("=" * 60)
             log_structured_evaluation(logger, labels[test_pixels], final_classified_map[test_pixels], ACA_BENTHIC_CLASSES, "[空間獨立測試區] ")
 
-    logger.info("
-" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info(">>> 【2. 全場景參考標籤 (Full Scene Reference)】精度評估：")
     logger.info("=" * 60)
     log_structured_evaluation(logger, labels[trainable_pixels], final_classified_map[trainable_pixels], ACA_BENTHIC_CLASSES, "[全場景參考] ")
