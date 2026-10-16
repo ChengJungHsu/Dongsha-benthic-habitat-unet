@@ -537,29 +537,40 @@ def inspect_checkpoint_architecture(ckpt, default_num_classes=6, logger=None):
     """
     state_dict = ckpt['model_state_dict'] if (isinstance(ckpt, dict) and 'model_state_dict' in ckpt) else ckpt
     has_depth_branch = any(k.startswith('depth_branch.') for k in state_dict.keys())
+    enc1_in_channels = state_dict['enc1.conv1.weight'].shape[1]
     
-    if isinstance(ckpt, dict) and 'op_channels' in ckpt:
-        op_channels = int(ckpt['op_channels'])
-        depth_in_channels = int(ckpt.get('depth_in_channels', 1 if has_depth_branch else 0))
-        use_late_fusion = bool(ckpt.get('use_late_fusion', has_depth_branch))
-        total_in_channels = int(ckpt.get('in_channels', op_channels + depth_in_channels))
+    # 1. 優先檢查是否為 Late Fusion
+    if has_depth_branch:
+        use_late_fusion = True
+        op_channels = enc1_in_channels  # 4 或 8
+        depth_in_channels = state_dict['depth_branch.net.0.weight'].shape[1] if 'depth_branch.net.0.weight' in state_dict else 1
+        total_in_channels = op_channels + depth_in_channels
     else:
-        enc1_in_channels = state_dict['enc1.conv1.weight'].shape[1]
-        if has_depth_branch:
-            use_late_fusion = True
-            op_channels = enc1_in_channels
-            depth_in_channels = state_dict['depth_branch.net.0.weight'].shape[1] if 'depth_branch.net.0.weight' in state_dict else 1
-            total_in_channels = op_channels + depth_in_channels
+        # 2. 無獨立水深分支：區分 Early Fusion (5CH / 9CH) 與 純光譜 (4CH / 8CH)
+        use_late_fusion = False
+        if enc1_in_channels == 5:
+            # 5CH Early Fusion: 4 個光譜波段 (RGB&NIR) + 1 個水深通道
+            total_in_channels = 5
+            op_channels = 4
+            depth_in_channels = 1
+        elif enc1_in_channels == 9:
+            # 9CH Early Fusion: 8 個光譜波段 + 1 個水深通道
+            total_in_channels = 9
+            op_channels = 8
+            depth_in_channels = 1
         else:
-            use_late_fusion = False
-            if enc1_in_channels in [5, 9]:
-                total_in_channels = enc1_in_channels
-                depth_in_channels = 1
-                op_channels = total_in_channels - depth_in_channels
-            else:
-                total_in_channels = enc1_in_channels
-                op_channels = enc1_in_channels
-                depth_in_channels = 0
+            # 純光譜模式 (4CH 或 8CH)
+            total_in_channels = enc1_in_channels
+            op_channels = enc1_in_channels
+            depth_in_channels = 0
+
+    # 若 ckpt 字典有明確標記，且數值合理，作為驗證參考
+    if isinstance(ckpt, dict) and 'op_channels' in ckpt and 'depth_in_channels' in ckpt:
+        meta_op = int(ckpt['op_channels'])
+        meta_depth = int(ckpt['depth_in_channels'])
+        if meta_op + meta_depth == total_in_channels:
+            op_channels = meta_op
+            depth_in_channels = meta_depth
 
     if logger:
         logger.info("-" * 65)
@@ -755,10 +766,11 @@ def run_standalone_evaluation_pipeline(
         roi_path, base_crs, target_res=target_res, logger=logger
     )
 
-    # 3. 根據 op_channels 自動匹配波段索引 (1-based)
+    # 3. 根據 op_channels 自動匹配光譜波段索引 (1-based)
     if op_channels == 4:
         if total_sat_bands >= 8:
-            target_bands = [2, 4, 6, 8] # Blue, Green, Red, NIR
+            # 從 8 波段 SuperDove 影像擷取 RGB & NIR: [Blue(2), Green(4), Red(6), NIR(8)]
+            target_bands = [2, 4, 6, 8]
             logger.info("自動對應: 從 8 波段影像擷取 4 波段 [Blue(2), Green(4), Red(6), NIR(8)]")
         else:
             target_bands = list(range(1, 5))
@@ -768,9 +780,9 @@ def run_standalone_evaluation_pipeline(
         logger.info("自動對應: 讀取全 8 光譜波段 [1 ~ 8]")
     else:
         target_bands = list(range(1, op_channels + 1))
-        logger.info(f"自動對應: 讀取前 {op_channels} 個波段")
+        logger.info(f"自動對應: 讀取前 {op_channels} 個波段: {target_bands}")
 
-    # 4. 呼叫共用特徵準備模組 (保證數值同構)
+    # 4. 呼叫共用特徵準備模組 (保證數值同構，此處 include_depth 會依據 depth_in_channels > 0 正確串接水深)
     logger.info(">>> 階段 3: 調用共用模組準備特徵張量 (光譜正規化與水深串接)...")
     final_feature_stack, valid_water_pixels, _, _, _, _ = prepare_feature_stack(
         sat_file=image_path,
@@ -780,7 +792,7 @@ def run_standalone_evaluation_pipeline(
         target_shape=target_shape,
         inside_roi_mask=inside_roi_mask,
         target_band_indices=target_bands,
-        include_depth=(depth_in_channels > 0),
+        include_depth=(depth_in_channels > 0),  # 5CH Early Fusion 時為 True，會正確串接水深為第 5 通道！
         z_max=z_max,
         logger=logger
     )
