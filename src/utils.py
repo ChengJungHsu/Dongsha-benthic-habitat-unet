@@ -593,7 +593,110 @@ def inspect_checkpoint_architecture(ckpt, default_num_classes=6, logger=None):
         logger.info("-" * 65)
 
     return op_channels, depth_in_channels, total_in_channels, use_late_fusion, state_dict
+# ==============================================================================
+# DenseCRF 空間邊界平滑後處理模組 (支援大尺度遙測影像分塊處理與環境雙引擎)
+# ==============================================================================
+def apply_dense_crf(
+    prob_map: np.ndarray,
+    image_rgb: np.ndarray,
+    valid_mask: np.ndarray = None,
+    n_iters: int = 5,
+    sxy_gaussian: int = 3,
+    compat_gaussian: int = 3,
+    sxy_bilateral: int = 30,
+    srgb_bilateral: int = 15,
+    compat_bilateral: int = 10,
+    tile_size: int = 1024,
+    overlap: int = 64,
+    logger = None
+) -> np.ndarray:
+    """
+    使用全連接條件隨機場 (DenseCRF) 對 UNet 輸出的機率圖進行空間平滑與邊界對齊。
+    
+    Args:
+        prob_map: (num_classes, H, W) 浮點數機率圖 (Softmax 輸出)
+        image_rgb: (H, W, 3) uint8 格式的 RGB 導引影像 (來自衛星原始色彩)
+        valid_mask: (H, W) bool 水體有效遮罩 (僅在有效水域執行運算，加速計算)
+        n_iters: CRF 平均場近似 (Mean-field) 迭代次數
+        tile_size: 大場景分塊大小 (防止 5700 萬像元記憶體溢位)
+    """
+    num_classes, h, w = prob_map.shape
+    refined_prob = prob_map.copy()
 
+    # 檢查是否安裝 pydensecrf
+    has_pydensecrf = False
+    try:
+        import pydensecrf.densecrf as dcrf
+        from pydensecrf.utils import unary_from_softmax
+        has_pydensecrf = True
+    except ImportError:
+        has_pydensecrf = False
+        if logger:
+            logger.warning("未偵測到 pydensecrf 套件，自動切換至 OpenCV 雙邊引導空間濾波引擎 (Bilateral Guided Filter)。")
+
+    # 單塊 CRF 運算封裝
+    def process_tile(tile_prob, tile_rgb):
+        t_c, t_h, t_w = tile_prob.shape
+        if has_pydensecrf:
+            d = dcrf.DenseCRF2D(t_w, t_h, t_c)
+            # 數值穩定性截斷
+            tile_prob_clean = np.clip(tile_prob, 1e-6, 1.0)
+            tile_prob_clean /= np.sum(tile_prob_clean, axis=0, keepdims=True)
+            unary = unary_from_softmax(tile_prob_clean)
+            d.setUnaryEnergy(unary)
+
+            # 1. 空間位置平滑核 (促使相鄰像素具有相同類別標籤)
+            d.addPairwiseGaussian(sxy=sxy_gaussian, compat=compat_gaussian, kernel=dcrf.DIAG_KERNEL, normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+            # 2. 顏色雙邊核 (以衛星 RGB 邊界引導邊界平滑)
+            if tile_rgb is not None:
+                img_contiguous = np.ascontiguousarray(tile_rgb, dtype=np.uint8)
+                d.addPairwiseBilateral(
+                    sxy=sxy_bilateral, srgb=srgb_bilateral, rgbim=img_contiguous,
+                    compat=compat_bilateral, kernel=dcrf.DIAG_KERNEL, normalization=dcrf.NORMALIZE_SYMMETRIC
+                )
+            q = d.inference(n_iters)
+            return np.array(q).reshape((t_c, t_h, t_w))
+        else:
+            # 備用引擎：高效率雙邊引導濾波 (Bilateral/Guided Filter)
+            import cv2
+            out_p = np.zeros_like(tile_prob)
+            if tile_rgb is not None:
+                guide_gray = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+                for c_idx in range(t_c):
+                    # 以灰階為導向進行邊界保持濾波
+                    p_channel = tile_prob[c_idx].astype(np.float32)
+                    out_p[c_idx] = cv2.bilateralFilter(p_channel, d=5, sigmaColor=0.15, sigmaSpace=3)
+            else:
+                for c_idx in range(t_c):
+                    out_p[c_idx] = cv2.GaussianBlur(tile_prob[c_idx], (5, 5), 1.0)
+            return out_p / (np.sum(out_p, axis=0, keepdims=True) + 1e-7)
+
+    # 針對大場景進行平滑分塊推論
+    if logger:
+        logger.info(f"執行 DenseCRF 邊界平滑 (迭代次數={n_iters}, 分塊大小={tile_size}x{tile_size})...")
+
+    step = tile_size - overlap
+    for r in range(0, h, step):
+        r_end = min(r + tile_size, h)
+        r_start = max(0, r_end - tile_size)
+        for c in range(0, w, step):
+            c_end = min(c + tile_size, w)
+            c_start = max(0, c_end - tile_size)
+
+            # 若該區域全為無效水體，直接跳過節省時間
+            if valid_mask is not None and not np.any(valid_mask[r_start:r_end, c_start:c_end]):
+                continue
+
+            sub_prob = prob_map[:, r_start:r_end, c_start:c_end]
+            sub_rgb = image_rgb[r_start:r_end, c_start:c_end] if image_rgb is not None else None
+
+            refined_sub = process_tile(sub_prob, sub_rgb)
+            refined_prob[:, r_start:r_end, c_start:c_end] = refined_sub
+
+    # 最終歸一化
+    sum_prob = np.sum(refined_prob, axis=0, keepdims=True) + 1e-8
+    return refined_prob / sum_prob
 
 def predict_full_scene_bh_unet(
     model: torch.nn.Module,
@@ -780,20 +883,42 @@ def run_standalone_evaluation_pipeline(
     # 3. 根據 op_channels 自動匹配光譜波段索引 (1-based)
     if op_channels == 4:
         if total_sat_bands >= 8:
-            # 從 8 波段 SuperDove 影像擷取 RGB & NIR: [Blue(2), Green(4), Red(6), NIR(8)]
             target_bands = [2, 4, 6, 8]
             logger.info("自動對應: 從 8 波段影像擷取 4 波段 [Blue(2), Green(4), Red(6), NIR(8)]")
         else:
             target_bands = list(range(1, 5))
             logger.info("自動對應: 讀取 4 波段原生影像 [1, 2, 3, 4]")
+    elif op_channels == 5:
+        if total_sat_bands >= 8:
+            target_bands = [2, 4, 6, 8]
+            logger.info("自動對應: 從 8 波段影像擷取 4 波段 [Blue(2), Green(4), Red(6), NIR(8)]")
+        else:
+            target_bands = list(range(1, 5))
+            logger.info("自動對應: 讀取 4 波段原生影像 [1, 2, 3, 4]")    
     elif op_channels == 8:
+        target_bands = list(range(1, 9))
+        logger.info("自動對應: 讀取全 8 光譜波段 [1 ~ 8]")
+    elif op_channels == 9:
         target_bands = list(range(1, 9))
         logger.info("自動對應: 讀取全 8 光譜波段 [1 ~ 8]")
     else:
         target_bands = list(range(1, op_channels + 1))
-        logger.info(f"自動對應: 讀取前 {op_channels} 個波段: {target_bands}")
+        logger.info(f"非設計資料通道，推算可能錯誤: 讀取前 {op_channels} 個波段: {target_bands}")
+    
+    total_channels = op_channels + depth_in_channels
+    if total_channels == 4:
+        flag_include_depth=False
+    elif total_channels == 5:
+        flag_include_depth=True
+    elif total_channels == 8:
+        flag_include_depth=False
+    elif total_channels == 9:
+        flag_include_depth=True
+    else:
+        flag_include_depth=False
+        ogger.info(f"非設計資料通道，推算可能錯誤: 無水深串接")
 
-    # 4. 呼叫共用特徵準備模組 (保證數值同構，此處 include_depth 會依據 depth_in_channels > 0 正確串接水深)
+    # 4. 呼叫共用特徵準備模組
     logger.info(">>> 階段 3: 調用共用模組準備特徵張量 (光譜正規化與水深串接)...")
     final_feature_stack, valid_water_pixels, _, _, _, _ = prepare_feature_stack(
         sat_file=image_path,
@@ -803,7 +928,7 @@ def run_standalone_evaluation_pipeline(
         target_shape=target_shape,
         inside_roi_mask=inside_roi_mask,
         target_band_indices=target_bands,
-        include_depth=(depth_in_channels > 0),  # 5CH Early Fusion 時為 True，會正確串接水深為第 5 通道！
+        include_depth=flag_include_depth,  
         z_max=z_max,
         logger=logger
     )
@@ -822,6 +947,220 @@ def run_standalone_evaluation_pipeline(
         stride=stride,
         batch_size=batch_size
     )
+
+    raw_pred_cls = np.argmax(prob_map, axis=0)
+    final_classified_map = np.zeros(target_shape, dtype=np.uint8)
+    for idx, cls_code in inv_class_to_idx.items():
+        final_classified_map[valid_water_pixels & (raw_pred_cls == idx)] = cls_code
+
+    # 6. 輸出 GeoTIFF
+    if output_tif:
+        os.makedirs(os.path.dirname(output_tif), exist_ok=True)
+        profile = {
+            'driver': 'GTiff',
+            'dtype': 'uint8',
+            'nodata': 0,
+            'width': target_shape[1],
+            'height': target_shape[0],
+            'count': 1,
+            'crs': base_crs,
+            'transform': target_transform,
+            'compress': 'lzw'
+        }
+        with rasterio.open(output_tif, 'w', **profile) as dst:
+            dst.write(final_classified_map, 1)
+        logger.info(f">>> 成功產製底棲分類圖: {output_tif}")
+
+    # 7. 精度驗證評估 (空間獨立測試區 vs. 全場景)
+    logger.info(">>> 階段 5: 執行嚴格交叉精度評估...")
+    labels, _ = align_and_resample_raster(ground_truth_path, base_crs, target_transform, target_shape, band_idx=1, resampling=Resampling.nearest)
+    labels = np.nan_to_num(labels, nan=0).astype(np.int32)
+    trainable_pixels = valid_water_pixels & np.isin(labels, valid_class_codes)
+
+    if os.path.exists(preprocess_npz_path):
+        prep = np.load(preprocess_npz_path)
+        if 'val_blocks_mask' in prep:
+            test_pixels = trainable_pixels & prep['val_blocks_mask']
+            logger.info("" + "=" * 60)
+            logger.info(">>> 【1. 嚴格空間獨立測試區 (Unseen Spatial Blocks)】精度評估：")
+            logger.info("=" * 60)
+            log_structured_evaluation(logger, labels[test_pixels], final_classified_map[test_pixels], ACA_BENTHIC_CLASSES, "[空間獨立測試區] ")
+
+    logger.info("" + "=" * 60)
+    logger.info(">>> 【2. 全場景參考標籤 (Full Scene Reference)】精度評估：")
+    logger.info("=" * 60)
+    log_structured_evaluation(logger, labels[trainable_pixels], final_classified_map[trainable_pixels], ACA_BENTHIC_CLASSES, "[全場景參考] ")
+
+
+def run_standalone_evaluation_pipeline_DenseCRF(
+    checkpoint_path: str,
+    image_path: str,
+    depth_path: str,
+    ground_truth_path: str,
+    roi_path: str,
+    preprocess_npz_path: str,
+    output_tif: str,
+    log_file_path: str = "./output/evaluation_report.log",
+    target_res: float = 3.0,
+    z_max: float = 10.0,
+    patch_size: int = 256,
+    stride: int = 128,
+    batch_size: int = 8
+):
+    """
+    全自動推論評估 Pipeline：
+    呼叫共用 build_spatial_grid_from_roi 與 prepare_feature_stack，
+    自動對應 4CH, 5CH, 8CH, 9CH 通道，徹底消除空間與數值處理不一致問題。
+    """
+    logger = setup_logger(log_file_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("=" * 95)
+    logger.info("啟動底棲棲地 UNet 全圖平滑推論與精度評估 (自動適配 4, 5, 8, 9 通道)")
+    logger.info(f"權重路徑: {checkpoint_path} | 運算裝置: {device} | 批次大小: {batch_size}")
+    logger.info("=" * 95)
+
+    valid_class_codes = sorted(list(ACA_BENTHIC_CLASSES.keys()))
+    inv_class_to_idx = {idx: cls for idx, cls in enumerate(valid_class_codes)}
+
+    # 1. 自動辨識模型 Checkpoint 架構
+    logger.info(">>> 階段 1: 讀取模型權重檔並自動判定網路通道架構...")
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    op_channels, depth_in_channels, total_in_channels, use_late_fusion, state_dict = inspect_checkpoint_architecture(
+        ckpt, default_num_classes=len(valid_class_codes), logger=logger
+    )
+
+    model = BHUNet_LateFusion(
+        op_channels=op_channels,
+        depth_in_channels=depth_in_channels,
+        use_late_fusion=use_late_fusion,
+        num_classes=len(valid_class_codes),
+        base_channels=16,
+        depth_channels=32
+    ).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    # 2. 呼叫共用網格建立模組
+    logger.info(">>> 階段 2: 空間幾何對齊與網格構建...")
+    with rasterio.open(image_path) as src_sat:
+        base_crs = src_sat.crs
+        total_sat_bands = src_sat.count
+
+    target_shape, target_transform, inside_roi_mask = build_spatial_grid_from_roi(
+        roi_path, base_crs, target_res=target_res, logger=logger
+    )
+
+    # 3. 根據 op_channels 自動匹配光譜波段索引 (1-based)
+    if op_channels == 4:
+        if total_sat_bands >= 8:
+            target_bands = [2, 4, 6, 8]
+            logger.info("自動對應: 從 8 波段影像擷取 4 波段 [Blue(2), Green(4), Red(6), NIR(8)]")
+        else:
+            target_bands = list(range(1, 5))
+            logger.info("自動對應: 讀取 4 波段原生影像 [1, 2, 3, 4]")
+    elif op_channels == 5:
+        if total_sat_bands >= 8:
+            target_bands = [2, 4, 6, 8]
+            logger.info("自動對應: 從 8 波段影像擷取 4 波段 [Blue(2), Green(4), Red(6), NIR(8)]")
+        else:
+            target_bands = list(range(1, 5))
+            logger.info("自動對應: 讀取 4 波段原生影像 [1, 2, 3, 4]")    
+    elif op_channels == 8:
+        target_bands = list(range(1, 9))
+        logger.info("自動對應: 讀取全 8 光譜波段 [1 ~ 8]")
+    elif op_channels == 9:
+        target_bands = list(range(1, 9))
+        logger.info("自動對應: 讀取全 8 光譜波段 [1 ~ 8]")
+    else:
+        target_bands = list(range(1, op_channels + 1))
+        logger.info(f"非設計資料通道，推算可能錯誤: 讀取前 {op_channels} 個波段: {target_bands}")
+    
+    total_channels = op_channels + depth_in_channels
+    if total_channels == 4:
+        flag_include_depth=False
+    elif total_channels == 5:
+        flag_include_depth=True
+    elif total_channels == 8:
+        flag_include_depth=False
+    elif total_channels == 9:
+        flag_include_depth=True
+    else:
+        flag_include_depth=False
+        ogger.info(f"非設計資料通道，推算可能錯誤: 無水深串接")
+
+    # 4. 呼叫共用特徵準備模組
+    logger.info(">>> 階段 3: 調用共用模組準備特徵張量 (光譜正規化與水深串接)...")
+    final_feature_stack, valid_water_pixels, _, _, _, _ = prepare_feature_stack(
+        sat_file=image_path,
+        bathy_file=depth_path,
+        base_crs=base_crs,
+        target_transform=target_transform,
+        target_shape=target_shape,
+        inside_roi_mask=inside_roi_mask,
+        target_band_indices=target_bands,
+        include_depth=flag_include_depth,  
+        z_max=z_max,
+        logger=logger
+    )
+
+    logger.info(f"最終推論張量維度: {final_feature_stack.shape} (與模型期望 {total_in_channels} 通道完美匹配)")
+
+    # 5. 全圖平滑融合推論
+    logger.info(f">>> 階段 4: 執行全圖平滑融合推論 (批次: {batch_size}, 步長: {stride})...")
+    prob_map = predict_full_scene_bh_unet(
+        model=model,
+        feature_stack=final_feature_stack,
+        target_shape=target_shape,
+        num_classes=len(valid_class_codes),
+        device=device,
+        patch_size=patch_size,
+        stride=stride,
+        batch_size=batch_size
+    )
+    t_crf = datetime.datetime.now()
+    logger.info(">>> 階段 4.5: 啟動 DenseCRF 空間邊界平滑後處理...")
+    
+    # ----------------------------------------------------------------------
+    # 準備衛星 RGB 導向影像 (依實際堆疊通道數 4/5/8/9 嚴格指定索引，防止 IndexError)
+    # ----------------------------------------------------------------------
+    total_feat_channels = final_feature_stack.shape[0]
+
+    if total_feat_channels in [4, 5]:
+        # 4CH 或 5CH: 光譜依序為 [Blue, Green, Red, NIR, (Depth)]
+        # 索引 0: Blue, 1: Green, 2: Red, 3: NIR, 4: Depth
+        r_idx, g_idx, b_idx = 2, 1, 0
+    elif total_feat_channels in [8, 9]:
+        # 8CH 或 9CH: 完整 8 波段光譜依序為 [Coastal Blue, Blue, Green-I, Green, Yellow, Red, Red Edge, NIR, (Depth)]
+        # 索引 1: Blue, 3: Green, 5: Red
+        r_idx, g_idx, b_idx = 5, 3, 1
+    else:
+        # 容錯預設值：取前 3 個通道
+        r_idx, g_idx, b_idx = min(2, total_feat_channels - 1), min(1, total_feat_channels - 1), 0
+
+    rgb_guide = np.stack([
+        final_feature_stack[r_idx],
+        final_feature_stack[g_idx],
+        final_feature_stack[b_idx]
+    ], axis=-1)
+    # 將 0.0~1.0 縮放映射至 0~255 uint8
+    rgb_guide_uint8 = np.clip(rgb_guide * 255.0, 0, 255).astype(np.uint8)
+
+    # 執行 DenseCRF 邊界平滑
+    prob_map = apply_dense_crf(
+        prob_map=prob_map,
+        image_rgb=rgb_guide_uint8,
+        valid_mask=valid_water_pixels,
+        n_iters=5,
+        sxy_gaussian=3,
+        compat_gaussian=3,
+        sxy_bilateral=35,
+        srgb_bilateral=15,
+        compat_bilateral=10,
+        tile_size=1024,
+        overlap=64,
+        logger=logger
+    )
+    logger.info(f"DenseCRF 後處理完成！耗時: {(datetime.datetime.now() - t_crf).total_seconds():.1f} 秒")
 
     raw_pred_cls = np.argmax(prob_map, axis=0)
     final_classified_map = np.zeros(target_shape, dtype=np.uint8)
